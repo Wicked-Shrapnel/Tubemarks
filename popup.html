@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Video Bookmark</title><link rel="stylesheet" href="popup.css"></head>
+<body><main>
+  <header><h1>Video Bookmark</h1><button id="bookmarksToggle" class="library-button" aria-expanded="false">Bookmarks</button></header>
+  <section id="capture" class="capture checking">
+    <div class="detection"><span class="dot" aria-hidden="true"></span><p id="status">Checking this page for video…</p></div>
+    <input id="title" placeholder="Bookmark title">
+    <input id="note" placeholder="Add a note (optional)">
+    <button id="save" disabled>Save current position</button>
+    <div id="currentBookmarks"></div>
+    <div id="otherButtonSlot"><button id="otherBookmarks" class="secondary-button">Other bookmarks</button></div>
+  </section>
+  <section id="library" hidden><h2>Saved video folders</h2><div id="list"></div></section>
+</main><script src="popup.js"></script></body></html>
