@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Video Bookmark",
-  "version": "1.7.0",
+  "version": "1.15.0",
   "description": "Save any HTML5 video with its exact playback position and a note.",
   "permissions": ["storage", "tabs", "scripting", "activeTab", "windows"],
   "host_permissions": ["<all_urls>"],

@@ -56,9 +56,10 @@ function progressPercent(bookmark) {
 async function renderCurrentBookmarks() {
   const container = $('currentBookmarks');
   const slot = $('otherButtonSlot');
-  if (!state) { container.innerHTML = ''; return; }
-  const bookmarks = (await getBookmarks()).filter((bookmark) => videoKey(bookmark.url) === videoKey(state.url));
-  if (!bookmarks.length) { container.innerHTML = ''; slot.hidden = false; return; }
+  if (!state) { container.innerHTML = ''; container.hidden = true; return; }
+  const bookmarks = (await getBookmarks()).filter((bookmark) => videoKey(bookmark.url) === videoKey(state.url)).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+  if (!bookmarks.length) { container.innerHTML = ''; container.hidden = false; slot.hidden = false; return; }
+  container.hidden = false;
   container.innerHTML = `<div class="current-heading">Bookmarks on this video</div>${bookmarks.map((bookmark) => { const percent = progressPercent(bookmark); return `<article class="current-bookmark"><strong>${escapeHtml(bookmark.title)}</strong><small>${formatTime(bookmark.time)}${Number.isFinite(bookmark.duration) && bookmark.duration > 0 ? ` / ${formatTime(bookmark.duration)}${percent !== null ? ` · ${percent}%` : ''}` : ''}</small>${percent !== null ? `<div class="progress-track"><div class="progress-fill" style="width:${percent}%"></div></div>` : ''}<br><a href="${escapeHtml(bookmarkUrl(bookmark))}" target="_blank">Play from timestamp</a></article>`; }).join('')}`;
   slot.hidden = true;
 }
@@ -67,6 +68,8 @@ function setDetection(kind, message) {
   $('capture').className = `capture ${kind}`;
   $('status').textContent = message;
   $('save').disabled = kind !== 'ready';
+  $('bookmarkForm').hidden = kind !== 'ready';
+  $('currentBookmarks').hidden = kind !== 'ready';
 }
 
 async function getBookmarks() {
@@ -112,10 +115,12 @@ async function renderBookmarks() {
 }
 
 function inspectFrame() {
+  const watchPage = location.hostname.includes('youtube.com') && location.pathname === '/watch' && new URL(location.href).searchParams.has('v');
   const readCreatorForVideo = (video) => {
     const card = video.closest('ytd-rich-item-renderer, ytd-video-renderer, ytd-compact-video-renderer, ytd-playlist-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media') || video.parentElement?.closest('ytd-rich-item-renderer, ytd-video-renderer, ytd-playlist-video-renderer');
-    const watchPage = location.pathname === '/watch' && new URL(location.href).searchParams.has('v');
-    const scope = card || (watchPage ? document : video.closest('ytd-player, #player, ytd-popup-container') || video.parentElement);
+    const watchOwner = watchPage ? document.querySelector('ytd-watch-metadata ytd-video-owner-renderer, ytd-watch-metadata #owner, ytd-video-secondary-info-renderer ytd-video-owner-renderer') : null;
+    const scope = card || watchOwner;
+    if (!scope) return { name: '', image: '', title: document.title, videoId: '', sourceUrl: location.href };
     const nameSelectors = [
       '#channel-name yt-formatted-string', '#channel-name a', '#channel-name', 'ytd-channel-name yt-formatted-string#text',
       'ytd-channel-name #text', 'ytd-channel-name', '[itemprop="author"] [itemprop="name"]', '[aria-label*="by "]', 'meta[name="author"]', 'meta[itemprop="author"]'
@@ -164,6 +169,7 @@ function inspectFrame() {
       currentTime: Number(video.currentTime) || 0,
       duration: Number(video.duration),
       area: Math.max(0, box.width) * Math.max(0, box.height),
+      active: video.readyState >= 1 && !video.ended && Boolean(video.currentSrc || video.src) && (watchPage || (!video.paused && video.currentTime > 0)),
       playing: !video.paused && !video.ended,
       ...readCreatorForVideo(video)
     };
@@ -172,10 +178,33 @@ function inspectFrame() {
   return candidates[0] || null;
 }
 
+function inspectYouTubePlayer() {
+  const details = window.ytInitialPlayerResponse?.videoDetails;
+  if (!details?.videoId) return null;
+  return {
+    videoId: details.videoId,
+    title: details.title || '',
+    author: details.author || '',
+    channelId: details.channelId || ''
+  };
+}
+
+function inspectYouTubeWatchOwner() {
+  const owner = document.querySelector('ytd-watch-metadata ytd-video-owner-renderer, ytd-watch-metadata #owner');
+  if (!owner) return null;
+  const nameElement = owner.querySelector('#channel-name a, #channel-name yt-formatted-string, ytd-channel-name #text, #owner-name a');
+  const avatar = owner.querySelector('#avatar img, ytd-channel-avatar img, yt-img-shadow img');
+  const name = nameElement?.textContent?.trim() || nameElement?.getAttribute('title') || '';
+  const image = avatar?.currentSrc || avatar?.src || avatar?.getAttribute('data-src') || '';
+  return name ? { name, image } : null;
+}
+
 async function detectVideo() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id || !/^https?:/i.test(tab.url || '')) {
+      state = null;
+      $('creator').hidden = true;
       setDetection('error', 'This page cannot be checked. Open a normal webpage with a video.');
       return;
     }
@@ -184,23 +213,50 @@ async function detectVideo() {
       target: { tabId: tab.id, allFrames: true },
       func: inspectFrame
     });
-    const videos = results.map((entry) => entry.result).filter(Boolean).sort((a, b) => Number(b.playing) - Number(a.playing) || b.area - a.area);
+    const videos = results.map((entry) => entry.result).filter((video) => video?.active && video.area > 0).sort((a, b) => Number(b.playing) - Number(a.playing) || b.area - a.area);
     if (!videos.length) {
+      state = null;
+      $('creator').hidden = true;
       setDetection('error', 'No compatible video detected. Start the video, then reopen this popup.');
       return;
     }
 
     const video = videos[0];
-    state = { title: video.title || tab.title, url: video.sourceUrl || tab.url, time: video.currentTime, duration: video.duration, creatorName: video.name, creatorImage: video.image };
-    $('title').value = state.title || '';
-    if (state.creatorName || state.creatorImage) {
+    let playerMetadata = null;
+    let ownerMetadata = null;
+    if (/youtube\.com/i.test(tab.url || '')) {
+      const metadataResults = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', func: inspectYouTubePlayer });
+      playerMetadata = metadataResults[0]?.result || null;
+      const ownerResults = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: inspectYouTubeWatchOwner });
+      ownerMetadata = ownerResults[0]?.result || null;
+    }
+    const authoritativeName = playerMetadata?.author || ownerMetadata?.name || video.name || '';
+    const ownerMatches = authoritativeName && ownerMetadata?.name && ownerMetadata.name.trim().toLowerCase() === authoritativeName.trim().toLowerCase();
+    const videoMatches = authoritativeName && video.name && video.name.trim().toLowerCase() === authoritativeName.trim().toLowerCase();
+    const verifiedImage = ownerMatches ? ownerMetadata.image : videoMatches ? video.image : '';
+    const nextState = {
+      title: playerMetadata?.title || video.title || tab.title,
+      url: playerMetadata?.videoId ? `https://www.youtube.com/watch?v=${playerMetadata.videoId}` : video.sourceUrl || tab.url,
+      time: video.currentTime,
+      duration: video.duration,
+      creatorName: authoritativeName,
+      creatorImage: verifiedImage
+    };
+    const sourceChanged = !state || videoKey(state.url) !== videoKey(nextState.url);
+    state = nextState;
+    if (sourceChanged || !$('title').value) $('title').value = state.title || '';
+    $('creator').hidden = true;
+    $('creator').innerHTML = '';
+    if (state.creatorName) {
       $('creator').hidden = false;
-      $('creator').innerHTML = `${state.creatorImage ? `<img src="${escapeHtml(state.creatorImage)}" alt="">` : ''}<span>${escapeHtml(state.creatorName || 'Channel')}</span>`;
+      $('creator').innerHTML = `${state.creatorImage ? `<img src="${escapeHtml(state.creatorImage)}" alt="">` : ''}<span>${escapeHtml(state.creatorName)}</span>`;
     }
     const durationText = Number.isFinite(video.duration) && video.duration > 0 ? ` / ${formatTime(video.duration)}` : '';
     setDetection('ready', `Video detected — ready to save at ${formatTime(video.currentTime)}${durationText}.`);
-    await renderCurrentBookmarks();
+    if (sourceChanged) await renderCurrentBookmarks();
   } catch (error) {
+    state = null;
+    $('creator').hidden = true;
     setDetection('error', 'Brave blocked access to this page. Refresh it after reloading the extension.');
   }
 }
@@ -259,3 +315,4 @@ $('otherBookmarks').addEventListener('click', async () => {
 
 renderBookmarks();
 detectVideo();
+setInterval(detectVideo, 1500);
